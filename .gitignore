@@ -1,0 +1,62 @@
+# R specific
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Data files (exclude large downloads)
+data/raw/**
+*.parquet
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+
+# Keep data structure but ignore contents
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/aggregated/.gitkeep
+!data/boundaries/.gitkeep
+
+# Temporary files
+*.tmp
+*.log
+*.cache
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# RStudio
+*.Rproj
+.Rproj.user/
+
+# Environment
+.Renviron
+.env
+
+# Output files
+*.html
+*.pdf
+*.docx
+figures/*.png
+figures/*.jpg
+figures/*.pdf
+
+# Package management
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
+
+# Keep renv.lock for reproducibility
+!renv.lock
+!renv/activate.R
+!renv/settings.dcf

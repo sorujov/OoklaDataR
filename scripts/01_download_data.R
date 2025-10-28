@@ -8,9 +8,13 @@
 # =============================================================================
 
 library(tidyverse)
+library(stringr)
 library(arrow)
 library(here)
 library(httr)
+library(sf)
+library(rnaturalearth)
+library(lwgeom)
 
 cat("=== OoklaDataR - Data Download ===\n\n")
 
@@ -22,6 +26,14 @@ S3_BASE <- "https://ookla-open-data.s3.amazonaws.com"
 
 # Create directories
 dir.create(here("data", "raw"), recursive = TRUE, showWarnings = FALSE)
+
+# --- Pre-flight checks -------------------------------------------------------
+required_pkgs <- c("tidyverse","arrow","here","httr","sf","rnaturalearth","lwgeom")
+missing <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing) > 0) {
+  stop(paste0("Missing required packages: ", paste(missing, collapse = ", "),
+             "\nPlease install them before running the pipeline."))
+}
 
 # Function to generate all quarters between start and end
 generate_quarters <- function(start_year, start_q, end_year, end_q) {
@@ -172,24 +184,54 @@ for (i in seq_along(quarters)) {
   }
   
   cat("\n✓ Quarter", year, "Q", quarter, "download complete\n")
-  
+
   # Call filtering script if it exists
+  increased_processed <- FALSE
   if (file.exists(here("scripts", "02_filter_by_country.R"))) {
     cat("\nFiltering by CIS countries...\n")
+
+    # Count processed files before filtering
+    processed_before <- length(list.files(here("data", "processed"), pattern = "\\.rds$"))
+
+    filter_error <- NULL
     tryCatch({
       source(here("scripts", "02_filter_by_country.R"), local = TRUE)
       total_processed <- total_processed + 1
     }, error = function(e) {
-      warning("Error in filtering script:", e$message)
+      filter_error <<- e
+      warning("Error in filtering script: ", e$message)
     })
+
+    # Count processed files after filtering
+    processed_after <- length(list.files(here("data", "processed"), pattern = "\\.rds$"))
+    increased_processed <- processed_after > processed_before
+
+    if (!is.null(filter_error)) {
+      cat("⚠️  Skipping raw cleanup due to filtering error. Raw files retained in data/raw for retry.\n")
+    }
   }
-  
-  # Clean up raw files to save space
-  cat("\nCleaning up raw files to save disk space...\n")
+
+  # Clean up raw files to save space ONLY if filtering produced outputs
   raw_files <- list.files(here("data", "raw"), pattern = "\\.parquet$", full.names = TRUE)
   if (length(raw_files) > 0) {
-    file.remove(raw_files)
-    cat("✓ Removed", length(raw_files), "raw Parquet files\n")
+    if (isTRUE(increased_processed)) {
+      cat("\nCleaning up raw files to save disk space...\n")
+      file.remove(raw_files)
+      cat("✓ Removed", length(raw_files), "raw Parquet files\n")
+    } else {
+      cat("\n⚠️  No new processed files detected. Raw Parquet files were NOT deleted so you can retry filtering.\n")
+    }
+  }
+
+  # Optionally update aggregated outputs incrementally when new processed data appears
+  if (isTRUE(increased_processed) && file.exists(here("scripts", "03_aggregate_data.R"))) {
+    cat("\nUpdating aggregated CSVs with currently processed data...\n")
+    tryCatch({
+      source(here("scripts", "03_aggregate_data.R"), local = TRUE)
+      cat("✓ Aggregated CSVs refreshed\n")
+    }, error = function(e) {
+      warning("Aggregation step failed this round: ", e$message)
+    })
   }
   
   # Small pause to be nice to the server

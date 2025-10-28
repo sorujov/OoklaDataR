@@ -124,12 +124,39 @@ for (data_type in c("mobile", "fixed")) {
       # Read with bbox filter
       ds <- open_dataset(parquet_file)
       
-      cis_tiles <- ds %>%
-        filter(
-          tile_x >= CIS_BBOX$xmin & tile_x <= CIS_BBOX$xmax,
-          tile_y >= CIS_BBOX$ymin & tile_y <= CIS_BBOX$ymax
-        ) %>%
-        collect()
+      # Check schema
+      schema_cols <- names(ds$schema)
+      has_tile_coords <- all(c("tile_x", "tile_y") %in% schema_cols)
+      
+      if (has_tile_coords) {
+        cat("  Using tile_x/tile_y bbox (new schema)...\n")
+        cis_tiles <- ds %>%
+          filter(
+            tile_x >= CIS_BBOX$xmin & tile_x <= CIS_BBOX$xmax,
+            tile_y >= CIS_BBOX$ymin & tile_y <= CIS_BBOX$ymax
+          ) %>%
+          collect()
+      } else {
+        cat("  Old schema detected. Loading all tiles...\n")
+        cis_tiles <- ds %>% collect()
+        
+        # Create CIS bounding box polygon
+        cis_bbox_wkt <- sprintf(
+          "POLYGON((%f %f, %f %f, %f %f, %f %f, %f %f))",
+          CIS_BBOX$xmin, CIS_BBOX$ymin,
+          CIS_BBOX$xmax, CIS_BBOX$ymin,
+          CIS_BBOX$xmax, CIS_BBOX$ymax,
+          CIS_BBOX$xmin, CIS_BBOX$ymax,
+          CIS_BBOX$xmin, CIS_BBOX$ymin
+        )
+        cis_bbox_sf <- st_as_sfc(cis_bbox_wkt, crs = 4326)
+        
+        # Convert tiles and filter
+        tiles_temp <- st_as_sf(cis_tiles, wkt = "tile", crs = 4326)
+        tiles_temp <- st_make_valid(tiles_temp)
+        intersects_cis <- st_intersects(tiles_temp, cis_bbox_sf, sparse = FALSE)[,1]
+        cis_tiles <- cis_tiles[intersects_cis, ]
+      }
       
       cat("✓ Filtered to", nrow(cis_tiles), "CIS tiles\n")
       

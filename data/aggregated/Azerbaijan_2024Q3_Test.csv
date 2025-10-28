@@ -1,3 +1,0 @@
-type,download_mbps,upload_mbps,latency_ms,tile_count,total_tests
-mobile,46.9,13.5,20,5568,18399
-fixed,51.2,50.2,8,16544,373162

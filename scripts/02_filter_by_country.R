@@ -56,8 +56,42 @@ if (!file.exists(boundaries_file)) {
   cat("✓ Loaded boundaries for", nrow(cis_countries), "countries\n\n")
 }
 
-# CIS bounding box for pre-filtering
+# CIS bounding box for generating quadkey prefixes
 CIS_BBOX <- list(xmin = 19.6, ymin = 36.7, xmax = 180, ymax = 81.9)
+
+# Helper: Generate quadkey prefixes for a bounding box
+generate_quadkey_prefixes <- function(bbox, zoom = 4) {
+  latlon_to_quadkey <- function(lat, lon, zoom) {
+    lat_rad <- lat * pi / 180
+    n <- 2^zoom
+    x <- floor((lon + 180) / 360 * n)
+    y <- floor((1 - log(tan(lat_rad) + 1/cos(lat_rad)) / pi) / 2 * n)
+    
+    quadkey <- ""
+    for (i in zoom:1) {
+      digit <- 0
+      mask <- bitwShiftL(1, i - 1)
+      if (bitwAnd(as.integer(x), as.integer(mask)) != 0) digit <- digit + 1
+      if (bitwAnd(as.integer(y), as.integer(mask)) != 0) digit <- digit + 2
+      quadkey <- paste0(quadkey, digit)
+    }
+    return(quadkey)
+  }
+  
+  # Generate grid points across the bbox
+  lat_seq <- seq(bbox$ymin, bbox$ymax, by = 2)  # Every 2 degrees
+  lon_seq <- seq(bbox$xmin, bbox$xmax, by = 2)
+  
+  grid <- expand.grid(lat = lat_seq, lon = lon_seq)
+  quadkeys <- mapply(latlon_to_quadkey, grid$lat, grid$lon, 
+                     MoreArgs = list(zoom = zoom))
+  
+  # Return unique prefixes
+  unique(quadkeys)
+}
+
+# Generate CIS quadkey prefixes once at module load
+CIS_QUADKEYS <- generate_quadkey_prefixes(CIS_BBOX, zoom = 4)
 
 # Function to filter Parquet file by country
 filter_parquet_by_countries <- function(parquet_file, countries_sf, output_dir) {
@@ -65,24 +99,43 @@ filter_parquet_by_countries <- function(parquet_file, countries_sf, output_dir) 
   cat("Processing:", basename(parquet_file), "\n")
   
   tryCatch({
-    # Read Parquet file with CIS bounding box filter (OPTIMIZED!)
-    cat("  Reading Parquet file with CIS bbox filter...\n")
+    cat("  Opening dataset...\n")
     ds <- open_dataset(parquet_file)
     
-    # Pre-filter by CIS bounding box BEFORE loading into memory
-    df <- ds %>%
-      filter(
-        tile_x >= CIS_BBOX$xmin & tile_x <= CIS_BBOX$xmax,
-        tile_y >= CIS_BBOX$ymin & tile_y <= CIS_BBOX$ymax
-      ) %>%
-      collect()
+    # Check schema to determine filtering strategy
+    schema_cols <- names(ds$schema)
+    has_tile_coords <- all(c("tile_x", "tile_y") %in% schema_cols)
+    
+    if (has_tile_coords) {
+      # NEW SCHEMA (2023+): Use tile_x/tile_y bbox filter
+      cat("  New schema detected. Using tile_x/tile_y bbox filter...\n")
+      df <- ds %>%
+        filter(
+          tile_x >= CIS_BBOX$xmin & tile_x <= CIS_BBOX$xmax,
+          tile_y >= CIS_BBOX$ymin & tile_y <= CIS_BBOX$ymax
+        ) %>%
+        collect()
+      cat("  Loaded", format(nrow(df), big.mark = ","), "CIS tiles (bbox filtered)\n")
+      
+    } else {
+      # OLD SCHEMA (pre-2023): Use quadkey prefix filter
+      cat("  Old schema detected. Using quadkey prefix filter...\n")
+      
+      prefix_length <- nchar(CIS_QUADKEYS[1])
+      
+      df <- ds %>%
+        mutate(qk_prefix = substr(quadkey, 1, prefix_length)) %>%
+        filter(qk_prefix %in% CIS_QUADKEYS) %>%
+        select(-qk_prefix) %>%
+        collect()
+      
+      cat("  Loaded", format(nrow(df), big.mark = ","), "CIS tiles (quadkey filtered)\n")
+    }
     
     if (nrow(df) == 0) {
       cat("  ✗ No tiles in CIS region\n")
       return(NULL)
     }
-    
-    cat("  Loaded", nrow(df), "CIS tiles (bbox filtered)\n")
     
     # Check for geometry column (might be named 'tile' or 'geometry')
     geom_col <- NULL

@@ -97,13 +97,9 @@ for (i in seq_along(config$countries)) {
       country_name, paste(rep(" ", 50 - nchar(country_name)), collapse = ""), "│\n")
   cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
   
-  # Create task list
-  tasks <- expand.grid(
-    year = ALL_QUARTERS$year,
-    quarter = ALL_QUARTERS$quarter,
-    network_type = NETWORK_TYPES,
-    stringsAsFactors = FALSE
-  )
+  # Create task list - one row per valid quarter/network combination
+  tasks <- ALL_QUARTERS %>%
+    crossing(network_type = NETWORK_TYPES)
   
   # Check for completed tasks
   tasks$output_file <- file.path(

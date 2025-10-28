@@ -1,11 +1,11 @@
 # =============================================================================
-# Ultra Memory-Safe Batch Processing
+# Ultra Memory-Safe Batch Processing - FINAL OPTIMIZED VERSION
 # =============================================================================
-# This version includes:
-# - Sequential processing only (no parallelization)
+# Memory optimizations:
+# - Arrow streaming with pre-filtering
 # - Aggressive garbage collection
-# - Memory monitoring
-# - Automatic pausing if memory gets too high
+# - Memory monitoring and auto-pause
+# - Sequential processing only
 # - Resume capability
 # =============================================================================
 
@@ -18,7 +18,7 @@ library(rnaturalearth)
 source(here("scripts", "data_download", "process_ookla_data.R"))
 
 cat("╔═══════════════════════════════════════════════════════════════════════╗\n")
-cat("║     Ultra Memory-Safe Batch Processing (Sequential Only)            ║\n")
+cat("║     Ultra Memory-Safe Batch Processing (Final Optimized)            ║\n")
 cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
 
 BATCH_START <- Sys.time()
@@ -35,8 +35,17 @@ dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(AGGREGATED_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(LOG_DIR, recursive = TRUE, showWarnings = FALSE)
 
-# Memory limit threshold (in MB) - adjust based on your system
-MEMORY_THRESHOLD_MB <- 4000  # Pause if memory usage exceeds this
+# AGGRESSIVE MEMORY SETTINGS
+MEMORY_THRESHOLD_MB <- 3000  # Lower threshold for safety
+GC_INTERVAL <- 3             # Force full GC every N tasks
+
+# Disable s2 spherical geometry (reduces memory overhead)
+sf_use_s2(FALSE)
+
+# Arrow memory optimizations
+options(arrow.unsafe_memory = FALSE)
+arrow::set_cpu_count(2)      # Limit CPU threads
+arrow::set_io_thread_count(2) # Limit I/O threads
 
 # Load config
 config <- readRDS(here("config.rds"))
@@ -53,12 +62,16 @@ ALL_QUARTERS <- expand.grid(
 
 NETWORK_TYPES <- c("fixed", "mobile")
 
+# Configuration summary
 cat("Configuration:\n")
+cat("  Project root:", here(), "\n")
+cat("  Output directory:", OUTPUT_DIR, "\n")
 cat("  Countries:", length(config$countries), "\n")
 cat("  Quarters:", nrow(ALL_QUARTERS), "\n")
 cat("  Network types:", length(NETWORK_TYPES), "\n")
 cat("  Total tasks:", length(config$countries) * nrow(ALL_QUARTERS) * length(NETWORK_TYPES), "\n")
-cat("  Memory threshold:", MEMORY_THRESHOLD_MB, "MB\n\n")
+cat("  Memory threshold:", MEMORY_THRESHOLD_MB, "MB\n")
+cat("  GC interval:", GC_INTERVAL, "tasks\n\n")
 
 # =============================================================================
 # SETUP
@@ -79,27 +92,37 @@ if (!file.exists(boundaries_file)) {
 }
 
 cat("✓ Loaded", nrow(cis_countries), "countries\n\n")
-
 cat("⚠️  SEQUENTIAL MODE: Processing one task at a time\n")
-cat("⚠️  This is the slowest but MOST reliable approach\n\n")
+cat("⚠️  Arrow streaming enabled for memory efficiency\n\n")
 
 # =============================================================================
-# HELPER: Check Memory Usage
+# HELPER: Enhanced Memory Monitor
 # =============================================================================
-check_memory <- function(threshold_mb = MEMORY_THRESHOLD_MB, wait_if_high = TRUE) {
-  mem_info <- gc(full = FALSE, verbose = FALSE)
-  mem_used_mb <- mem_info[2, 2]  # Ncells (MB)
+
+check_memory <- function(threshold_mb = MEMORY_THRESHOLD_MB, 
+                        force_cleanup = FALSE) {
   
-  if (mem_used_mb > threshold_mb && wait_if_high) {
-    cat("\n⚠️  High memory usage:", round(mem_used_mb, 1), "MB\n")
-    cat("   Forcing garbage collection and waiting...\n")
+  # Get detailed memory info
+  mem_info <- gc(full = FALSE, verbose = FALSE)
+  mem_used_mb <- sum(mem_info[, 2])  # Total MB used
+  mem_max_mb <- sum(mem_info[, 6])   # Max used since last reset
+  
+  mem_percent <- ifelse(mem_max_mb > 0, (mem_used_mb / mem_max_mb) * 100, 0)
+  
+  if (mem_used_mb > threshold_mb || force_cleanup) {
+    cat(sprintf("\n⚠️  Memory: %.0f MB (%.0f%% of session max)\n", 
+                mem_used_mb, mem_percent))
+    cat("   Forcing full garbage collection...\n")
     
-    gc(full = TRUE, verbose = FALSE)
-    Sys.sleep(5)
+    # Triple GC with pauses
+    for (i in 1:3) {
+      gc(full = TRUE, verbose = FALSE, reset = TRUE)
+      Sys.sleep(1)
+    }
     
     mem_info <- gc(full = FALSE, verbose = FALSE)
-    mem_used_mb <- mem_info[2, 2]
-    cat("   After cleanup:", round(mem_used_mb, 1), "MB\n\n")
+    mem_used_mb <- sum(mem_info[, 2])
+    cat(sprintf("   After cleanup: %.0f MB\n\n", mem_used_mb))
   }
   
   return(mem_used_mb)
@@ -111,6 +134,7 @@ check_memory <- function(threshold_mb = MEMORY_THRESHOLD_MB, wait_if_high = TRUE
 
 all_results <- list()
 error_log <- list()
+task_counter <- 0  # Global task counter for GC interval
 
 for (i in seq_along(config$countries)) {
   
@@ -120,8 +144,8 @@ for (i in seq_along(config$countries)) {
   
   cat("\n")
   cat("╔═══════════════════════════════════════════════════════════════════════╗\n")
-  cat("│ Country", i, "of", length(config$countries), ":", 
-      country_name, paste(rep(" ", 50 - nchar(country_name)), collapse = ""), "│\n")
+  cat(sprintf("│ Country %d of %d: %-54s │\n", 
+              i, length(config$countries), country_name))
   cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
   
   # Create task list
@@ -139,29 +163,33 @@ for (i in seq_along(config$countries)) {
   tasks_remaining <- tasks %>% filter(!completed)
   
   if (sum(tasks$completed) > 0) {
-    cat("Skipping", sum(tasks$completed), "already completed tasks\n")
+    cat(sprintf("✓ Skipping %d already completed tasks\n", sum(tasks$completed)))
   }
   
   if (nrow(tasks_remaining) == 0) {
-    cat("All tasks complete for", country_name, "!\n")
+    cat("✅ All tasks complete for", country_name, "!\n")
     next
   }
   
-  cat("Processing", nrow(tasks_remaining), "tasks SEQUENTIALLY...\n\n")
+  cat(sprintf("Processing %d tasks sequentially...\n\n", nrow(tasks_remaining)))
   
   # Process each task one at a time
   country_results <- list()
   
   for (j in seq_len(nrow(tasks_remaining))) {
     task <- tasks_remaining[j, ]
+    task_counter <- task_counter + 1
     
-    # Check memory before task
-    mem_before <- check_memory()
+    # Force cleanup every GC_INTERVAL tasks
+    if (task_counter %% GC_INTERVAL == 0) {
+      check_memory(force_cleanup = TRUE)
+    } else {
+      mem_before <- check_memory()
+    }
     
-    cat(sprintf("[%d/%d] %s %dQ%d %s (mem: %.0fMB)...", 
+    cat(sprintf("[%d/%d] %s %dQ%d %s ", 
                 j, nrow(tasks_remaining), 
-                country_code, task$year, task$quarter, task$network_type,
-                mem_before))
+                country_code, task$year, task$quarter, task$network_type))
     
     task_start <- Sys.time()
     
@@ -179,12 +207,28 @@ for (i in seq_along(config$countries)) {
       )
       
       task_time <- difftime(Sys.time(), task_start, units = "secs")
-      cat(sprintf(" ✓ (%.1fs)\n", task_time))
+      
+      # Verify file was actually created
+      output_file <- file.path(OUTPUT_DIR, 
+                              paste0(country_code, "_", task$year, "Q", 
+                                    task$quarter, "_", task$network_type, ".rds"))
+      
+      if (file.exists(output_file)) {
+        file_size <- file.info(output_file)$size / 1024  # KB
+        cat(sprintf("✓ (%.1fs, %.0fKB)\n", task_time, file_size))
+      } else {
+        cat(sprintf("⚠️  completed but file not saved (%.1fs)\n", task_time))
+      }
+      
       res
       
     }, error = function(e) {
-      cat(" ✗ ERROR\n")
-      cat("   Error message:", conditionMessage(e), "\n")
+      cat("✗ ERROR\n")
+      cat(sprintf("   %s\n", conditionMessage(e)))
+      
+      # Force aggressive cleanup after error
+      gc(full = TRUE, verbose = FALSE, reset = TRUE)
+      Sys.sleep(3)
       
       # Log error
       error_log[[length(error_log) + 1]] <<- list(
@@ -201,14 +245,9 @@ for (i in seq_along(config$countries)) {
     
     country_results[[j]] <- result
     
-    # Aggressive memory cleanup after EACH task
-    gc(full = TRUE, verbose = FALSE)
-    
-    # Brief pause to let system stabilize
+    # Aggressive cleanup after each task
+    gc(full = TRUE, verbose = FALSE, reset = TRUE)
     Sys.sleep(1)
-    
-    # Check memory after task
-    mem_after <- check_memory(wait_if_high = TRUE)
   }
   
   # Collect results for this country
@@ -218,32 +257,29 @@ for (i in seq_along(config$countries)) {
     all_results[[i]] <- country_df
     
     # Save country-specific file
-    write_csv(country_df, 
-              file.path(AGGREGATED_DIR, paste0(country_code, "_all_quarters.csv")))
+    country_file <- file.path(AGGREGATED_DIR, 
+                             paste0(country_code, "_all_quarters.csv"))
+    write_csv(country_df, country_file)
     
-    cat("\n✅ Saved results for", country_name, "\n")
+    cat(sprintf("\n✅ Saved %d records for %s\n", nrow(country_df), country_name))
   } else {
-    cat("\n⚠️  No new results for", country_name, "(may have been errors or all skipped)\n")
+    cat(sprintf("\n⚠️  No new results for %s\n", country_name))
   }
   
   # Aggressive memory cleanup between countries
   rm(country_results, country_df, tasks, tasks_remaining)
-  gc(full = TRUE, verbose = FALSE)
-  
-  # Longer pause between countries
+  gc(full = TRUE, verbose = FALSE, reset = TRUE)
   Sys.sleep(3)
   
+  # Progress reporting
   elapsed <- difftime(Sys.time(), country_start, units = "mins")
-  cat("\n✅", country_name, "complete in", round(elapsed, 1), "minutes\n")
-  
-  # Progress estimate
   total_elapsed <- difftime(Sys.time(), BATCH_START, units = "mins")
   estimated_total <- total_elapsed * length(config$countries) / i
   remaining <- estimated_total - total_elapsed
   
-  cat("Progress:", i, "/", length(config$countries), "countries |",
-      "Elapsed:", round(total_elapsed, 1), "min |",
-      "Est. remaining:", round(remaining, 1), "min\n")
+  cat(sprintf("\n✅ %s complete in %.1f minutes\n", country_name, elapsed))
+  cat(sprintf("📊 Progress: %d/%d countries | Elapsed: %.1f min | Est. remaining: %.1f min\n",
+              i, length(config$countries), total_elapsed, remaining))
 }
 
 # =============================================================================
@@ -259,8 +295,9 @@ final_results <- bind_rows(all_results)
 
 if (nrow(final_results) > 0) {
   # Save master file
-  write_csv(final_results, file.path(AGGREGATED_DIR, "CIS_Internet_Speed_2019-2025.csv"))
-  cat("✓ Saved master file: CIS_Internet_Speed_2019-2025.csv\n\n")
+  master_file <- file.path(AGGREGATED_DIR, "CIS_Internet_Speed_2019-2025.csv")
+  write_csv(final_results, master_file)
+  cat(sprintf("✓ Saved master file: %d records\n", nrow(final_results)))
   
   # Summary statistics
   summary_stats <- final_results %>%
@@ -272,34 +309,53 @@ if (nrow(final_results) > 0) {
       avg_latency = round(mean(latency_ms, na.rm = TRUE), 0),
       total_tiles = sum(tile_count, na.rm = TRUE),
       .groups = "drop"
-    )
+    ) %>%
+    arrange(country_name, network_type)
   
-  write_csv(summary_stats, file.path(AGGREGATED_DIR, "summary_statistics.csv"))
+  summary_file <- file.path(AGGREGATED_DIR, "summary_statistics.csv")
+  write_csv(summary_stats, summary_file)
   
-  cat("Summary Statistics:\n")
+  cat("\nSummary Statistics:\n")
   print(summary_stats, n = Inf)
+} else {
+  cat("⚠️  No results to aggregate\n")
 }
 
-# Save error log
+# Save error log if any errors occurred
 if (length(error_log) > 0) {
   error_df <- bind_rows(error_log)
-  write_csv(error_df, file.path(LOG_DIR, paste0("errors_", 
-                                                 format(Sys.time(), "%Y%m%d_%H%M%S"), 
-                                                 ".csv")))
-  cat("\n⚠️  Errors occurred:", nrow(error_df), "tasks failed\n")
-  cat("   Error log saved to:", LOG_DIR, "\n")
+  error_file <- file.path(LOG_DIR, 
+                         paste0("errors_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"))
+  write_csv(error_df, error_file)
+  
+  cat(sprintf("\n⚠️  %d tasks failed - error log saved\n", nrow(error_df)))
+  cat("   Most common errors:\n")
+  
+  error_summary <- error_df %>%
+    count(error, sort = TRUE) %>%
+    head(3)
+  
+  for (k in seq_len(nrow(error_summary))) {
+    cat(sprintf("   - %s (%d times)\n", 
+                error_summary$error[k], error_summary$n[k]))
+  }
 }
 
 TOTAL_TIME <- difftime(Sys.time(), BATCH_START, units = "hours")
 
-cat("\n\n")
+cat("\n")
 cat("╔═══════════════════════════════════════════════════════════════════════╗\n")
 cat("║                  ✅ BATCH COMPLETE!                                  ║\n")
 cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
 
-cat("📊 Total time:", round(TOTAL_TIME, 2), "hours\n")
-cat("📁 Output:", AGGREGATED_DIR, "\n")
-cat("📝 Processed files:", list.files(OUTPUT_DIR, pattern = "\\.rds$") %>% length(), "\n\n")
+cat(sprintf("📊 Total time: %.2f hours\n", TOTAL_TIME))
+cat(sprintf("📁 Output directory: %s\n", AGGREGATED_DIR))
+cat(sprintf("📝 Processed files: %d\n", 
+            length(list.files(OUTPUT_DIR, pattern = "\\.rds$"))))
+
+# Final memory report
+final_mem <- gc(full = TRUE, verbose = FALSE)
+cat(sprintf("💾 Final memory usage: %.0f MB\n\n", sum(final_mem[, 2])))
 
 cat("💡 To resume if interrupted, just run this script again.\n")
 cat("   It will automatically skip completed tasks.\n\n")

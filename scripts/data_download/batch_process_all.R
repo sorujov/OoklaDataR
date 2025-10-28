@@ -74,9 +74,10 @@ if (!file.exists(boundaries_file)) {
 
 cat("✓ Loaded", nrow(cis_countries), "countries\n\n")
 
-# Setup parallel cores
-n_cores <- max(1, parallel::detectCores() - 1)
+# Setup parallel cores - REDUCED TO PREVENT OOM
+n_cores <- 2  # Reduced from auto-detect to prevent memory issues
 cat("Using", n_cores, "CPU cores for parallel processing\n\n")
+cat("⚠️  Memory-safe mode: Using only 2 cores to prevent OOM errors\n\n")
 
 # =============================================================================
 # MAIN LOOP: Process One Country at a Time
@@ -128,28 +129,44 @@ for (i in seq_along(config$countries)) {
   # Setup parallel backend
   plan(multisession, workers = n_cores)
   
-  # Process all quarters in parallel
-  country_results <- future_pmap(
-    tasks_remaining %>% select(year, quarter, network_type),
-    function(year, quarter, network_type) {
-      process_ookla_data(
-        country_code = country_code,
-        year = year,
-        quarter = quarter,
-        network_type = network_type,
-        cis_countries = cis_countries,
-        config = config,
-        save_output = TRUE,
-        output_dir = OUTPUT_DIR,
-        verbose = FALSE
-      )
-    },
-    .options = furrr_options(seed = TRUE),
-    .progress = TRUE
-  )
+  # Process all quarters in parallel with error handling
+  country_results <- tryCatch({
+    future_pmap(
+      tasks_remaining %>% select(year, quarter, network_type),
+      function(year, quarter, network_type) {
+        tryCatch({
+          process_ookla_data(
+            country_code = country_code,
+            year = year,
+            quarter = quarter,
+            network_type = network_type,
+            cis_countries = cis_countries,
+            config = config,
+            save_output = TRUE,
+            output_dir = OUTPUT_DIR,
+            verbose = FALSE
+          )
+        }, error = function(e) {
+          cat("\n⚠️  Error in", country_code, year, "Q", quarter, network_type, ":", 
+              conditionMessage(e), "\n")
+          return(NULL)
+        })
+      },
+      .options = furrr_options(seed = TRUE),
+      .progress = TRUE
+    )
+  }, error = function(e) {
+    cat("\n❌ CRITICAL ERROR for", country_name, ":", conditionMessage(e), "\n")
+    cat("Saving progress and stopping gracefully...\n")
+    plan(sequential)
+    return(list())
+  })
   
   # Close parallel backend
   plan(sequential)
+  
+  # Force garbage collection to free memory
+  gc(full = TRUE, verbose = FALSE)
   
   # Collect results
   country_df <- bind_rows(country_results[!sapply(country_results, is.null)])
@@ -160,11 +177,18 @@ for (i in seq_along(config$countries)) {
     # Save country-specific file
     write_csv(country_df, 
               file.path(AGGREGATED_DIR, paste0(country_code, "_all_quarters.csv")))
+    
+    cat("\n✅ Saved results for", country_name, "\n")
+  } else {
+    cat("\n⚠️  No new results for", country_name, "(may have been errors or all skipped)\n")
   }
   
-  # Clean memory
+  # Aggressive memory cleanup to prevent OOM
   rm(country_results, country_df, tasks, tasks_remaining)
-  gc()
+  gc(full = TRUE, verbose = FALSE)
+  
+  # Small pause to let system stabilize
+  Sys.sleep(2)
   
   elapsed <- difftime(Sys.time(), country_start, units = "mins")
   cat("\n✅", country_name, "complete in", round(elapsed, 1), "minutes\n")
@@ -221,4 +245,8 @@ cat("║                  ✅ BATCH COMPLETE!                                  �
 cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
 
 cat("📊 Total time:", round(TOTAL_TIME, 2), "hours\n")
-cat("📁 Output:", AGGREGATED_DIR, "\n\n")
+cat("📁 Output:", AGGREGATED_DIR, "\n")
+cat("📝 Processed files:", list.files(OUTPUT_DIR, pattern = "\\.rds$") %>% length(), "\n\n")
+
+cat("💡 To resume if interrupted, just run this script again.\n")
+cat("   It will automatically skip completed tasks.\n\n")

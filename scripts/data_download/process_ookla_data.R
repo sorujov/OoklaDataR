@@ -118,9 +118,9 @@ process_ookla_data <- function(
     quarter_start, "_performance_", network_type, "_tiles.parquet"
   )
   
-  if (verbose) cat("1. Downloading from S3...\n")
+  if (verbose) cat("1. Downloading from S3 (streaming mode)...\n")
   
-  # Download and filter
+  # Download and filter with CHUNKING to prevent OOM
   tryCatch({
     ds <- open_dataset(s3_uri, format = "parquet")
     
@@ -128,25 +128,107 @@ process_ookla_data <- function(
     schema_cols <- names(ds$schema)
     has_tile_coords <- all(c("tile_x", "tile_y") %in% schema_cols)
     
+    # STREAMING APPROACH: Process in chunks
     if (has_tile_coords) {
       # NEW SCHEMA
-      if (verbose) cat("   New schema: tile_x/tile_y bbox filter\n")
-      tiles <- ds %>%
+      if (verbose) cat("   New schema: tile_x/tile_y bbox filter (streaming)\n")
+      
+      # Apply filter but DON'T collect yet
+      ds_filtered <- ds %>%
         filter(
           tile_x >= country_bbox$xmin & tile_x <= country_bbox$xmax,
           tile_y >= country_bbox$ymin & tile_y <= country_bbox$ymax
-        ) %>%
-        collect()
+        )
+      
+      # Check row count BEFORE collecting
+      row_count <- ds_filtered %>% count() %>% pull(n)
+      
+      if (row_count == 0) {
+        warning("No tiles found for ", country_code, " ", year, " Q", quarter)
+        return(NULL)
+      }
+      
+      # If dataset is large, process in chunks
+      if (row_count > 100000) {
+        if (verbose) cat("   Large dataset (", format(row_count, big.mark = ","), 
+                        " rows) - processing in chunks\n")
+        
+        chunk_size <- 50000
+        tiles_list <- list()
+        
+        for (i in seq(0, row_count, by = chunk_size)) {
+          chunk <- ds_filtered %>%
+            slice(i:(i + chunk_size - 1)) %>%
+            collect()
+          
+          tiles_list[[length(tiles_list) + 1]] <- chunk
+          
+          if (verbose && length(tiles_list) %% 5 == 0) {
+            cat("   Processed", format(i + nrow(chunk), big.mark = ","), 
+                "of", format(row_count, big.mark = ","), "rows\n")
+          }
+          
+          # Force garbage collection after each chunk
+          gc(verbose = FALSE)
+        }
+        
+        tiles <- bind_rows(tiles_list)
+        rm(tiles_list)
+        gc(verbose = FALSE)
+      } else {
+        # Small dataset, collect all at once
+        tiles <- ds_filtered %>% collect()
+      }
+      
     } else {
       # OLD SCHEMA
-      if (verbose) cat("   Old schema: quadkey prefix filter\n")
+      if (verbose) cat("   Old schema: quadkey prefix filter (streaming)\n")
       prefix_length <- nchar(quadkey_prefixes[1])
       
-      tiles <- ds %>%
+      ds_filtered <- ds %>%
         mutate(qk_prefix = substr(quadkey, 1, prefix_length)) %>%
         filter(qk_prefix %in% quadkey_prefixes) %>%
-        select(-qk_prefix) %>%
-        collect()
+        select(-qk_prefix)
+      
+      # Check row count BEFORE collecting
+      row_count <- ds_filtered %>% count() %>% pull(n)
+      
+      if (row_count == 0) {
+        warning("No tiles found for ", country_code, " ", year, " Q", quarter)
+        return(NULL)
+      }
+      
+      # If dataset is large, process in chunks
+      if (row_count > 100000) {
+        if (verbose) cat("   Large dataset (", format(row_count, big.mark = ","), 
+                        " rows) - processing in chunks\n")
+        
+        chunk_size <- 50000
+        tiles_list <- list()
+        
+        for (i in seq(0, row_count, by = chunk_size)) {
+          chunk <- ds_filtered %>%
+            slice(i:(i + chunk_size - 1)) %>%
+            collect()
+          
+          tiles_list[[length(tiles_list) + 1]] <- chunk
+          
+          if (verbose && length(tiles_list) %% 5 == 0) {
+            cat("   Processed", format(i + nrow(chunk), big.mark = ","), 
+                "of", format(row_count, big.mark = ","), "rows\n")
+          }
+          
+          # Force garbage collection after each chunk
+          gc(verbose = FALSE)
+        }
+        
+        tiles <- bind_rows(tiles_list)
+        rm(tiles_list)
+        gc(verbose = FALSE)
+      } else {
+        # Small dataset, collect all at once
+        tiles <- ds_filtered %>% collect()
+      }
     }
     
     if (verbose) {
@@ -158,14 +240,73 @@ process_ookla_data <- function(
       return(NULL)
     }
     
-    # Convert to spatial
-    if (verbose) cat("2. Converting to spatial features...\n")
-    tiles_sf <- st_as_sf(tiles, wkt = "tile", crs = 4326)
-    tiles_sf <- st_make_valid(tiles_sf)
+    # Convert to spatial IN CHUNKS to prevent OOM
+    if (verbose) cat("2. Converting to spatial features (chunked)...\n")
     
-    # Precise intersection
-    if (verbose) cat("3. Refining with country boundary...\n")
-    tiles_final <- st_intersection(tiles_sf, country_boundary)
+    # Process spatial conversion in chunks
+    if (nrow(tiles) > 50000) {
+      chunk_size <- 25000
+      tiles_sf_list <- list()
+      
+      for (i in seq(1, nrow(tiles), by = chunk_size)) {
+        end_idx <- min(i + chunk_size - 1, nrow(tiles))
+        chunk <- tiles[i:end_idx, ]
+        
+        chunk_sf <- st_as_sf(chunk, wkt = "tile", crs = 4326)
+        chunk_sf <- st_make_valid(chunk_sf)
+        
+        tiles_sf_list[[length(tiles_sf_list) + 1]] <- chunk_sf
+        
+        if (verbose && length(tiles_sf_list) %% 5 == 0) {
+          cat("   Converted", format(end_idx, big.mark = ","), 
+              "of", format(nrow(tiles), big.mark = ","), "tiles\n")
+        }
+        
+        rm(chunk, chunk_sf)
+        gc(verbose = FALSE)
+      }
+      
+      tiles_sf <- do.call(rbind, tiles_sf_list)
+      rm(tiles_sf_list, tiles)
+      gc(verbose = FALSE)
+    } else {
+      tiles_sf <- st_as_sf(tiles, wkt = "tile", crs = 4326)
+      tiles_sf <- st_make_valid(tiles_sf)
+      rm(tiles)
+      gc(verbose = FALSE)
+    }
+    
+    # Precise intersection IN CHUNKS to prevent OOM
+    if (verbose) cat("3. Refining with country boundary (chunked)...\n")
+    
+    if (nrow(tiles_sf) > 50000) {
+      chunk_size <- 25000
+      tiles_final_list <- list()
+      
+      for (i in seq(1, nrow(tiles_sf), by = chunk_size)) {
+        end_idx <- min(i + chunk_size - 1, nrow(tiles_sf))
+        chunk <- tiles_sf[i:end_idx, ]
+        
+        chunk_final <- st_intersection(chunk, country_boundary)
+        tiles_final_list[[length(tiles_final_list) + 1]] <- chunk_final
+        
+        if (verbose && length(tiles_final_list) %% 5 == 0) {
+          cat("   Processed", format(end_idx, big.mark = ","), 
+              "of", format(nrow(tiles_sf), big.mark = ","), "tiles\n")
+        }
+        
+        rm(chunk, chunk_final)
+        gc(verbose = FALSE)
+      }
+      
+      tiles_final <- do.call(rbind, tiles_final_list)
+      rm(tiles_final_list, tiles_sf)
+      gc(verbose = FALSE)
+    } else {
+      tiles_final <- st_intersection(tiles_sf, country_boundary)
+      rm(tiles_sf)
+      gc(verbose = FALSE)
+    }
     
     if (verbose) {
       cat("✓ Final:", format(nrow(tiles_final), big.mark = ","), "tiles\n\n")

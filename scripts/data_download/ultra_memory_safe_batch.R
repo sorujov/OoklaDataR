@@ -1,22 +1,24 @@
 # =============================================================================
-# Parallel Batch Processing: All CIS Countries (2019-2025)
+# Ultra Memory-Safe Batch Processing
 # =============================================================================
-# Strategy: One country at a time, all quarters in parallel
-# Memory-safe approach for large-scale processing
+# This version includes:
+# - Sequential processing only (no parallelization)
+# - Aggressive garbage collection
+# - Memory monitoring
+# - Automatic pausing if memory gets too high
+# - Resume capability
 # =============================================================================
 
 library(tidyverse)
 library(sf)
 library(here)
 library(rnaturalearth)
-library(furrr)
-library(future)
 
 # Source the modular function
 source(here("scripts", "data_download", "process_ookla_data.R"))
 
 cat("╔═══════════════════════════════════════════════════════════════════════╗\n")
-cat("║     Parallel Batch: All CIS Countries & Quarters (2019-2025)        ║\n")
+cat("║     Ultra Memory-Safe Batch Processing (Sequential Only)            ║\n")
 cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
 
 BATCH_START <- Sys.time()
@@ -32,6 +34,9 @@ LOG_DIR <- here("logs")
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(AGGREGATED_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(LOG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Memory limit threshold (in MB) - adjust based on your system
+MEMORY_THRESHOLD_MB <- 4000  # Pause if memory usage exceeds this
 
 # Load config
 config <- readRDS(here("config.rds"))
@@ -52,7 +57,8 @@ cat("Configuration:\n")
 cat("  Countries:", length(config$countries), "\n")
 cat("  Quarters:", nrow(ALL_QUARTERS), "\n")
 cat("  Network types:", length(NETWORK_TYPES), "\n")
-cat("  Total tasks:", length(config$countries) * nrow(ALL_QUARTERS) * length(NETWORK_TYPES), "\n\n")
+cat("  Total tasks:", length(config$countries) * nrow(ALL_QUARTERS) * length(NETWORK_TYPES), "\n")
+cat("  Memory threshold:", MEMORY_THRESHOLD_MB, "MB\n\n")
 
 # =============================================================================
 # SETUP
@@ -74,42 +80,37 @@ if (!file.exists(boundaries_file)) {
 
 cat("✓ Loaded", nrow(cis_countries), "countries\n\n")
 
+cat("⚠️  SEQUENTIAL MODE: Processing one task at a time\n")
+cat("⚠️  This is the slowest but MOST reliable approach\n\n")
+
 # =============================================================================
-# PARALLELIZATION CONFIGURATION
+# HELPER: Check Memory Usage
 # =============================================================================
-# Adjust n_cores based on your system:
-#   1 core  = Slowest but safest (8GB RAM minimum)
-#   2 cores = Balanced (16GB RAM recommended)
-#   3 cores = Fast (24GB RAM recommended)
-#   4+ cores = Fastest (32GB+ RAM recommended)
-# =============================================================================
-
-# AUTO-DETECT available cores (but default to safe value)
-available_cores <- parallel::detectCores()
-
-# SET YOUR CORES HERE - adjust based on your RAM
-n_cores <- 1  # CHANGE THIS: 1 (safe), 2 (balanced), 3-4 (fast, needs more RAM)
-
-cat("System detected:", available_cores, "cores available\n")
-cat("Using:", n_cores, "core(s) for processing\n\n")
-
-if (n_cores == 1) {
-  cat("⚠️  SEQUENTIAL MODE: Most memory-safe, slowest\n")
-  cat("   Recommended for: Systems with 8-16GB RAM\n\n")
-} else if (n_cores <= 2) {
-  cat("⚖️  BALANCED MODE: Good speed/safety tradeoff\n")
-  cat("   Recommended for: Systems with 16-24GB RAM\n\n")
-} else {
-  cat("🚀 FAST MODE: Maximum speed, requires more RAM\n")
-  cat("   Recommended for: Systems with 24GB+ RAM\n\n")
-  cat("⚠️  If you experience OOM errors, reduce n_cores\n\n")
+check_memory <- function(threshold_mb = MEMORY_THRESHOLD_MB, wait_if_high = TRUE) {
+  mem_info <- gc(full = FALSE, verbose = FALSE)
+  mem_used_mb <- mem_info[2, 2]  # Ncells (MB)
+  
+  if (mem_used_mb > threshold_mb && wait_if_high) {
+    cat("\n⚠️  High memory usage:", round(mem_used_mb, 1), "MB\n")
+    cat("   Forcing garbage collection and waiting...\n")
+    
+    gc(full = TRUE, verbose = FALSE)
+    Sys.sleep(5)
+    
+    mem_info <- gc(full = FALSE, verbose = FALSE)
+    mem_used_mb <- mem_info[2, 2]
+    cat("   After cleanup:", round(mem_used_mb, 1), "MB\n\n")
+  }
+  
+  return(mem_used_mb)
 }
 
 # =============================================================================
-# MAIN LOOP: Process One Country at a Time
+# MAIN LOOP: Process One Country at a Time, One Task at a Time
 # =============================================================================
 
 all_results <- list()
+error_log <- list()
 
 for (i in seq_along(config$countries)) {
   
@@ -123,11 +124,11 @@ for (i in seq_along(config$countries)) {
       country_name, paste(rep(" ", 50 - nchar(country_name)), collapse = ""), "│\n")
   cat("╚═══════════════════════════════════════════════════════════════════════╝\n\n")
   
-  # Create task list - one row per valid quarter/network combination
+  # Create task list
   tasks <- ALL_QUARTERS %>%
     crossing(network_type = NETWORK_TYPES)
   
-  # Check for completed tasks (CHECKPOINT LOGIC)
+  # Check for completed tasks
   tasks$output_file <- file.path(
     OUTPUT_DIR,
     paste0(country_code, "_", tasks$year, "Q", tasks$quarter, "_", 
@@ -138,112 +139,79 @@ for (i in seq_along(config$countries)) {
   tasks_remaining <- tasks %>% filter(!completed)
   
   if (sum(tasks$completed) > 0) {
-    cat("✓ Checkpoint: Skipping", sum(tasks$completed), "already completed tasks\n")
+    cat("Skipping", sum(tasks$completed), "already completed tasks\n")
   }
   
   if (nrow(tasks_remaining) == 0) {
-    cat("✅ All tasks complete for", country_name, "!\n")
+    cat("All tasks complete for", country_name, "!\n")
     next
   }
   
-  cat("Processing", nrow(tasks_remaining), "remaining tasks...\n\n")
+  cat("Processing", nrow(tasks_remaining), "tasks SEQUENTIALLY...\n\n")
   
-  # Setup parallel backend (sequential if n_cores = 1)
-  if (n_cores > 1) {
-    plan(multisession, workers = n_cores)
-  } else {
-    plan(sequential)
+  # Process each task one at a time
+  country_results <- list()
+  
+  for (j in seq_len(nrow(tasks_remaining))) {
+    task <- tasks_remaining[j, ]
+    
+    # Check memory before task
+    mem_before <- check_memory()
+    
+    cat(sprintf("[%d/%d] %s %dQ%d %s (mem: %.0fMB)...", 
+                j, nrow(tasks_remaining), 
+                country_code, task$year, task$quarter, task$network_type,
+                mem_before))
+    
+    task_start <- Sys.time()
+    
+    result <- tryCatch({
+      res <- process_ookla_data(
+        country_code = country_code,
+        year = task$year,
+        quarter = task$quarter,
+        network_type = task$network_type,
+        cis_countries = cis_countries,
+        config = config,
+        save_output = TRUE,
+        output_dir = OUTPUT_DIR,
+        verbose = FALSE
+      )
+      
+      task_time <- difftime(Sys.time(), task_start, units = "secs")
+      cat(sprintf(" ✓ (%.1fs)\n", task_time))
+      res
+      
+    }, error = function(e) {
+      cat(" ✗ ERROR\n")
+      cat("   Error message:", conditionMessage(e), "\n")
+      
+      # Log error
+      error_log[[length(error_log) + 1]] <<- list(
+        country = country_code,
+        year = task$year,
+        quarter = task$quarter,
+        network_type = task$network_type,
+        error = conditionMessage(e),
+        timestamp = Sys.time()
+      )
+      
+      return(NULL)
+    })
+    
+    country_results[[j]] <- result
+    
+    # Aggressive memory cleanup after EACH task
+    gc(full = TRUE, verbose = FALSE)
+    
+    # Brief pause to let system stabilize
+    Sys.sleep(1)
+    
+    # Check memory after task
+    mem_after <- check_memory(wait_if_high = TRUE)
   }
   
-  # Process all quarters with error handling and memory management
-  country_results <- tryCatch({
-    
-    if (n_cores == 1) {
-      # SEQUENTIAL processing - most memory-safe
-      results_list <- list()
-      
-      for (j in seq_len(nrow(tasks_remaining))) {
-        task <- tasks_remaining[j, ]
-        
-        cat(sprintf("[%d/%d] %s %dQ%d %s...", 
-                    j, nrow(tasks_remaining), 
-                    country_code, task$year, task$quarter, task$network_type))
-        
-        result <- tryCatch({
-          res <- process_ookla_data(
-            country_code = country_code,
-            year = task$year,
-            quarter = task$quarter,
-            network_type = task$network_type,
-            cis_countries = cis_countries,
-            config = config,
-            save_output = TRUE,
-            output_dir = OUTPUT_DIR,
-            verbose = FALSE
-          )
-          cat(" ✓\n")
-          res
-        }, error = function(e) {
-          cat(" ✗ ERROR:", conditionMessage(e), "\n")
-          return(NULL)
-        })
-        
-        results_list[[j]] <- result
-        
-        # Aggressive memory cleanup after EACH task
-        gc(full = TRUE, verbose = FALSE)
-        
-        # Brief pause to let system stabilize
-        Sys.sleep(0.5)
-      }
-      
-      results_list
-      
-    } else {
-      # PARALLEL processing (if n_cores > 1)
-      cat(sprintf("Running %d tasks in parallel on %d cores...\n", 
-                  nrow(tasks_remaining), n_cores))
-      
-      future_pmap(
-        tasks_remaining %>% select(year, quarter, network_type),
-        function(year, quarter, network_type) {
-          tryCatch({
-            process_ookla_data(
-              country_code = country_code,
-              year = year,
-              quarter = quarter,
-              network_type = network_type,
-              cis_countries = cis_countries,
-              config = config,
-              save_output = TRUE,
-              output_dir = OUTPUT_DIR,
-              verbose = FALSE
-            )
-          }, error = function(e) {
-            cat("\n⚠️  Error in", country_code, year, "Q", quarter, network_type, ":", 
-                conditionMessage(e), "\n")
-            return(NULL)
-          })
-        },
-        .options = furrr_options(seed = TRUE),
-        .progress = TRUE
-      )
-    }
-    
-  }, error = function(e) {
-    cat("\n❌ CRITICAL ERROR for", country_name, ":", conditionMessage(e), "\n")
-    cat("Saving progress and stopping gracefully...\n")
-    plan(sequential)
-    return(list())
-  })
-  
-  # Close parallel backend
-  plan(sequential)
-  
-  # Force garbage collection to free memory
-  gc(full = TRUE, verbose = FALSE)
-  
-  # Collect results
+  # Collect results for this country
   country_df <- bind_rows(country_results[!sapply(country_results, is.null)])
   
   if (nrow(country_df) > 0) {
@@ -258,12 +226,12 @@ for (i in seq_along(config$countries)) {
     cat("\n⚠️  No new results for", country_name, "(may have been errors or all skipped)\n")
   }
   
-  # Aggressive memory cleanup to prevent OOM
+  # Aggressive memory cleanup between countries
   rm(country_results, country_df, tasks, tasks_remaining)
   gc(full = TRUE, verbose = FALSE)
   
-  # Small pause to let system stabilize
-  Sys.sleep(2)
+  # Longer pause between countries
+  Sys.sleep(3)
   
   elapsed <- difftime(Sys.time(), country_start, units = "mins")
   cat("\n✅", country_name, "complete in", round(elapsed, 1), "minutes\n")
@@ -310,6 +278,16 @@ if (nrow(final_results) > 0) {
   
   cat("Summary Statistics:\n")
   print(summary_stats, n = Inf)
+}
+
+# Save error log
+if (length(error_log) > 0) {
+  error_df <- bind_rows(error_log)
+  write_csv(error_df, file.path(LOG_DIR, paste0("errors_", 
+                                                 format(Sys.time(), "%Y%m%d_%H%M%S"), 
+                                                 ".csv")))
+  cat("\n⚠️  Errors occurred:", nrow(error_df), "tasks failed\n")
+  cat("   Error log saved to:", LOG_DIR, "\n")
 }
 
 TOTAL_TIME <- difftime(Sys.time(), BATCH_START, units = "hours")

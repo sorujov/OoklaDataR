@@ -307,6 +307,9 @@ if (nrow(final_results) > 0) {
       avg_download = round(mean(download_mbps, na.rm = TRUE), 1),
       avg_upload = round(mean(upload_mbps, na.rm = TRUE), 1),
       avg_latency = round(mean(latency_ms, na.rm = TRUE), 0),
+      median_download = round(mean(download_mbps_median, na.rm = TRUE), 1),
+      median_upload = round(mean(upload_mbps_median, na.rm = TRUE), 1),
+      median_latency = round(mean(latency_ms_median, na.rm = TRUE), 0),
       total_tiles = sum(tile_count, na.rm = TRUE),
       .groups = "drop"
     ) %>%

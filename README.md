@@ -48,29 +48,31 @@ This will install:
 
 ### Basic Usage
 
-**Step 1: Download and process data**
+**Run the automated pipeline**
 ```r
-# Download Ookla data from AWS S3 (processes quarter by quarter)
-source("scripts/01_download_data.R")
-
-# Filter by CIS countries
-source("scripts/02_filter_by_country.R")
-
-# Generate aggregated time series
-source("scripts/03_aggregate_data.R")
-
-# Extract Azerbaijan tiles for mapping
-source("scripts/04_azerbaijan_tiles.R")
+# This will download, filter, and aggregate all data automatically
+source("scripts/run_pipeline_auto.R")
 ```
 
-**Step 2: Access processed data**
+**Or run steps individually**
 ```r
-# Load aggregated data
-fixed_data <- read.csv("data/aggregated/Fixed.csv")
-mobile_data <- read.csv("data/aggregated/Cellular.csv")
+# Step 1: Download Ookla data from AWS S3 (processes quarter by quarter)
+source("scripts/01_download_data.R")
+
+# Step 2: Aggregate data (creates mean & median statistics)
+source("scripts/03_aggregate_data.R")
+```
+
+**Access the processed data**
+```r
+# Load the main aggregated dataset (all countries, all quarters)
+data <- read.csv("data/aggregated/CIS_Internet_Speed_2019-2025.csv")
+
+# Or load individual country files
+armenia_data <- read.csv("data/aggregated/AM_all_quarters.csv")
 
 # View structure
-head(fixed_data)
+head(data)
 ```
 
 ## Project Structure
@@ -78,23 +80,33 @@ head(fixed_data)
 ```
 OoklaDataR/
 ├── data/
-│   ├── raw/              # Temporary downloads (auto-deleted)
-│   ├── processed/        # Filtered country data
-│   ├── aggregated/       # Time series CSVs
+│   ├── processed/        # Filtered country data by quarter (RDS files)
+│   ├── aggregated/       # Aggregated CSV files (YOUR MAIN OUTPUT)
+│   │   ├── CIS_Internet_Speed_2019-2025.csv  # Combined dataset
+│   │   ├── AM_all_quarters.csv               # Armenia
+│   │   ├── AZ_all_quarters.csv               # Azerbaijan
+│   │   ├── BY_all_quarters.csv               # Belarus
+│   │   ├── KZ_all_quarters.csv               # Kazakhstan
+│   │   ├── KG_all_quarters.csv               # Kyrgyzstan
+│   │   ├── MD_all_quarters.csv               # Moldova
+│   │   ├── RU_all_quarters.csv               # Russia
+│   │   ├── TJ_all_quarters.csv               # Tajikistan
+│   │   ├── UZ_all_quarters.csv               # Uzbekistan
+│   │   ├── UA_all_quarters.csv               # Ukraine
+│   │   ├── GE_all_quarters.csv               # Georgia
+│   │   └── summary_statistics.csv            # Summary stats
 │   └── boundaries/       # Country shapefiles
 ├── scripts/
 │   ├── 00_setup.R                 # Setup and package installation
-│   ├── 01_download_data.R         # AWS S3 data download
-│   ├── 02_filter_by_country.R     # Spatial filtering
-│   ├── 03_aggregate_data.R        # Temporal aggregation
+│   ├── 01_download_data.R         # AWS S3 data download & filtering
+│   ├── 02_filter_by_country.R     # Spatial filtering (called by 01)
+│   ├── 03_aggregate_data.R        # Calculate mean & median statistics
 │   ├── 04_azerbaijan_tiles.R      # Azerbaijan tile extraction
-│   └── 05_create_maps.R           # Visualization (future)
-├── analysis/             # Analysis scripts
-├── reports/              # RMarkdown reports
-├── figures/              # Generated visualizations
-├── .gitignore           # Git ignore rules
+│   ├── run_pipeline_auto.R        # Automated pipeline (non-interactive)
+│   └── recalculate_with_medians.R # Recalculate with median values
 ├── config.rds           # Project configuration
-├── PROJECT_PLAN.md      # Detailed implementation plan
+├── QUICKSTART.md        # Quick start guide
+├── cleanup_project.R    # Cleanup script (already run)
 └── README.md            # This file
 ```
 
@@ -110,20 +122,44 @@ OoklaDataR/
 
 ## Output Data
 
-### Aggregated Time Series
-- `data/aggregated/Fixed.csv`: Fixed broadband statistics by country/month
-- `data/aggregated/Cellular.csv`: Mobile network statistics by country/month
+### Main Aggregated Dataset
+**File**: `data/aggregated/CIS_Internet_Speed_2019-2025.csv`
 
-**Format**:
+This is your primary output containing all 11 CIS countries from 2019 Q2 to 2025 Q3.
+
+**Columns**:
+- `download_mbps`, `upload_mbps`, `latency_ms` - **Mean values**
+- `download_mbps_median`, `upload_mbps_median`, `latency_ms_median` - **Median values**
+- `tile_count` - Number of geographic tiles
+- `total_tests` - Total number of speed tests
+- `total_devices` - Total number of unique devices
+- `country_code` - ISO 2-letter country code (AM, AZ, BY, etc.)
+- `country_name` - Full country name
+- `year`, `quarter` - Time period
+- `network_type` - "fixed" or "mobile"
+- `date` - First day of quarter (YYYY-MM-DD)
+
+**Example**:
 ```
-Country, Date, Download_Mbps, Upload_Mbps, Latency_ms, Tests_Count
-AZ, 2019-04-01, 45.2, 23.1, 18.5, 15234
+download_mbps,upload_mbps,latency_ms,download_mbps_median,upload_mbps_median,latency_ms_median,
+tile_count,total_tests,total_devices,country_code,country_name,year,quarter,network_type,date
+15.99,14.24,22.7,14.07,11.46,12,3237,55424,18180,AM,Armenia,2019,2,fixed,2019-06-01
+23.55,10.2,29,16.38,7.78,21,2479,13617,8114,AM,Armenia,2019,2,mobile,2019-06-01
 ```
 
-### Azerbaijan Spatial Data
-- `data/processed/azerbaijan_tiles/`: Tile-level data by quarter
-- Format: GeoPackage with geometries
-- Ready for detailed mapping and visualization
+### Individual Country Files
+Each country has its own CSV file:
+- `data/aggregated/AM_all_quarters.csv` - Armenia
+- `data/aggregated/AZ_all_quarters.csv` - Azerbaijan
+- `data/aggregated/BY_all_quarters.csv` - Belarus
+- ... (one file per country)
+
+Same format as the main file, but filtered to a single country.
+
+### Summary Statistics
+**File**: `data/aggregated/summary_statistics.csv`
+
+Contains overall statistics across all quarters for each country and network type.
 
 ## CIS Countries Covered
 
@@ -145,14 +181,19 @@ AZ, 2019-04-01, 45.2, 23.1, 18.5, 15234
 
 The project uses a **process-and-delete strategy** to minimize disk usage:
 
-1. Download one quarter (~10-50 GB)
-2. Filter by CIS countries
-3. Aggregate statistics
-4. Extract Azerbaijan tiles
-5. **Delete raw files**
+1. Download one quarter (~200-500 MB compressed)
+2. Filter by CIS countries using spatial boundaries
+3. Calculate mean and median statistics
+4. Save processed data (RDS files)
+5. **Delete raw Parquet files**
 6. Repeat for next quarter
 
-**Final storage**: < 5 GB persistent data
+**Current storage**:
+- Processed data (RDS): ~500 MB (all quarters, all countries, both network types)
+- Aggregated CSVs: ~2-3 MB (your main output files)
+- Total: < 1 GB
+
+**Note**: Raw downloads are automatically deleted after processing to save space. The processed RDS files in `data/processed/` can be regenerated if needed by re-running the download pipeline.
 
 ## Citation
 
